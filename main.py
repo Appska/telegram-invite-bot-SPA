@@ -1,4 +1,4 @@
-# main.py — Render + webhook (aiogram v3) + stages + accepts photo & image docs + 2s pauses + Sheets safe
+# main.py — Render + webhook (aiogram v3) + stages + accepts photo & image documents + 2s pauses + Sheets
 
 import os
 import json
@@ -27,7 +27,7 @@ BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
 SHEET_ID = os.getenv("SHEET_ID")                 # напр. 1392i1U93gV5...
-SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # JSON сервисного аккаунта (в одну строку)
+SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # весь JSON сервисного аккаунта в одну строку
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -41,68 +41,29 @@ FONT_NAME = "fonts/GothamPro-Black.ttf"
 FONT_COMP = "fonts/GothamPro-Medium.ttf"
 
 # ---------- Google Sheets helpers ----------
-def _normalize_creds(creds_json_str: str) -> dict | None:
-    try:
-        creds_dict = json.loads(creds_json_str)
-    except Exception as e:
-        log.exception("Sheets: не удалось распарсить JSON ключа: %s", e)
-        return None
-
-    pk = creds_dict.get("private_key", "")
-    # Если ключ вставлен как одна строка с символами \n — превратим их в реальные переводы строк
-    if "\\n" in pk and "\n" not in pk:
-        pk = pk.replace("\\n", "\n")
-        creds_dict["private_key"] = pk
-
-    if "BEGIN PRIVATE KEY" not in pk:
-        log.error("Sheets: private_key не содержит BEGIN PRIVATE KEY — проверь переменную SHEETS_CREDS_JSON")
-        return None
-    return creds_dict
-
 def get_worksheet():
-    """
-    Возвращает sheet1 или None (если переменные не заданы/ключ некорректный).
-    Безопасно: не валит бота при ошибках.
-    """
     if not (SHEET_ID and SHEETS_CREDS_JSON):
         log.info("Sheets: переменные не заданы (SHEET_ID/SHEETS_CREDS_JSON)")
         return None
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-    try:
-        from google.oauth2.service_account import Credentials
-        import gspread
-
-        creds_dict = _normalize_creds(SHEETS_CREDS_JSON)
-        if not creds_dict:
-            return None
-
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
-        )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.sheet1
-
-        # Автосоздаём заголовки, если лист пустой
-        if not ws.get_all_values():
-            ws.append_row(["Имя", "Фамилия", "Компания", "ID"])
-            log.info("Sheets: добавлена шапка листа")
-
-        return ws
-
-    except Exception as e:
-        log.exception("Sheets: ошибка подключения: %s", e)
-        return None
+    creds_dict = json.loads(SHEETS_CREDS_JSON)
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    return sh.sheet1
 
 def save_guest_to_sheets(user_id: int, first_name: str, last_name: str, company: str):
     try:
         ws = get_worksheet()
         if not ws:
-            log.info("Sheets: пропустили запись (ws=None)")
             return
         ws.append_row([first_name, last_name, company, str(user_id)])
         log.info("Sheets: записан гость %s %s (%s), id=%s", first_name, last_name, company, user_id)
@@ -232,26 +193,28 @@ async def text_router(message: types.Message):
         await asyncio.sleep(2)
         await message.answer(f"{first}, приятно познакомиться.")
         await asyncio.sleep(2)
-        await message.answer("Теперь пришли свою фотографию (как изображение, НЕ как файл). Можно и документом, если это картинка.")
+        await message.answer("Теперь пришли свою фотографию (как изображение, НЕ как файл).")
         return
 
     if st["stage"] == "need_photo":
-        await message.answer("Жду фото/картинку 🙂")
+        await message.answer("Жду фото как изображение 🙂")
         return
 
+    # запасной случай
     user_data[uid] = {"stage": "ask_first"}
     await message.answer("Давай начнём заново. Как тебя зовут?")
 
-# Фото как photo
+# Принимаем СНИМКИ как фотографии
 @dp.message(F.photo)
 async def on_photo(message: types.Message):
     await handle_image_message(message, source="photo")
 
-# Изображение как документ (mime image/*)
+# Принимаем СНИМКИ как документы (фотки, присланные «как файл»)
 @dp.message(F.document)
 async def on_document(message: types.Message):
     doc = message.document
     if not doc or not (doc.mime_type or "").startswith("image/"):
+        # не картинка — игнорируем
         return
     await handle_image_message(message, source="document")
 
@@ -274,7 +237,7 @@ async def handle_image_message(message: types.Message, source: str):
         else:
             image_bytes = await download_file_to_memory(message.document.file_id)
 
-        # Генерация пригласительного
+        # Генерим пригласительный
         path = make_invite(
             image_bytes=image_bytes,
             first_name=st.get('first_name', ''),
@@ -294,4 +257,107 @@ async def handle_image_message(message: types.Message, source: str):
         await asyncio.sleep(2)
         await message.answer(
             "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
-            "Следи за розыгрышем и его результатами в
+            "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
+            "Желаем тебе удачи! 🍀",
+            parse_mode="Markdown",
+        )
+        await asyncio.sleep(2)
+        await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
+
+        # Запись в таблицу
+        save_guest_to_sheets(uid, st.get('first_name',''), st.get('last_name',''), st.get('company',''))
+
+        # очистка и сброс
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        user_data[uid] = {"stage": "ask_first"}
+        log.info("Flow done, reset stage for %s", uid)
+
+    except FileNotFoundError as e:
+        log.exception("Template missing: %s", e)
+        await message.answer("Не найден файл templates/template.png (1080×1080). Загрузите шаблон и попробуйте снова.")
+    except Exception as e:
+        log.exception("Ошибка обработки изображения (uid=%s): %s", uid, e)
+        await message.answer("Ой! Картинка не обработалась. Пришли другое изображение или попробуй ещё раз.")
+
+@dp.callback_query(F.data == "retry_photo")
+async def retry_photo_handler(callback: CallbackQuery):
+    user_data[callback.from_user.id] = {"stage": "need_photo"}
+    await callback.message.answer("Окей! Отправь новое фото/изображение, и мы пересоздадим пригласительный ✨")
+    log.info("Retry requested by %s → stage need_photo", callback.from_user.id)
+
+@dp.message(Command("whoami"))
+async def whoami(message: types.Message):
+    await message.answer(f"Твой user_id: {message.from_user.id}")
+
+@dp.message(Command("draw"))
+async def draw_winner(message: types.Message):
+    admin_ids = [2002200912]
+    if message.from_user.id not in admin_ids:
+        await message.answer("У тебя нет доступа к розыгрышу.")
+        return
+
+    ws = get_worksheet()
+    if not ws:
+        await message.answer("Google Sheets не настроен.")
+        return
+
+    try:
+        records = ws.get_all_records()
+    except Exception as e:
+        await message.answer("Ошибка доступа к таблице.")
+        log.exception("Sheets: %s", e)
+        return
+
+    if not records:
+        await message.answer("Список участников пуст.")
+        return
+
+    await message.answer("🎰 Запускаем барабан...")
+    suspense_list = random.sample(records, min(6, len(records)))
+    for r in suspense_list[:-1]:
+        fn = r.get('Имя') or r.get('first_name') or ''
+        ln = r.get('Фамилия') or r.get('last_name') or ''
+        await asyncio.sleep(2)
+        await message.answer(f"🌀 {fn} {ln}...")
+    winner = suspense_list[-1]
+    fn = winner.get('Имя') or winner.get('first_name') or ''
+    ln = winner.get('Фамилия') or winner.get('last_name') or ''
+    company = winner.get('Компания') or winner.get('company') or ''
+    win_id = winner.get('ID') or winner.get('id') or ''
+
+    await asyncio.sleep(2)
+    await message.answer(f"🎉 Победитель:\n\n👑 {fn} {ln}, {company}\n\n🔥 Поздравляем!")
+    if win_id:
+        try:
+            await bot.send_message(int(win_id), f"🎉 Поздравляем, {fn} {ln}! Ты выиграл приз от Digital CPA Club 🎁")
+        except Exception as e:
+            await message.answer("⚠️ Не удалось отправить личное сообщение победителю.")
+            log.exception("Ошибка при отправке победителю: %s", e)
+
+# ---------- Webhook bootstrapping ----------
+async def on_startup(app: web.Application):
+    assert BASE_URL, "BASE_URL/RENDER_EXTERNAL_URL не задан"
+    url = BASE_URL.rstrip("/") + "/webhook"
+    await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+    log.info("Webhook set to %s", url)
+
+async def on_shutdown(app: web.Application):
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    finally:
+        await bot.session.close()
+
+def build_app():
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    return app
+
+if __name__ == "__main__":
+    web.run_app(build_app(), host="0.0.0.0", port=PORT)
+    
