@@ -1,73 +1,52 @@
-# main.py — Render + webhook (aiogram v3) + stages + Google Sheets
+# main.py
 
+import logging
 import os
+import asyncio
 import json
 import random
-import logging
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-
 from PIL import Image, ImageDraw, ImageFont
 
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+import gspread
+from google.oauth2.service_account import Credentials
 
-# ---------- Logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("invite-bot")
+from keep_alive import keep_alive
+keep_alive()
 
-# ---------- ENV
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_secret_123")
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("BASE_URL")
-PORT = int(os.getenv("PORT", "10000"))
 
-SHEET_ID = os.getenv("SHEET_ID")                 # напр. 1392i1U93gV5...
-SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # весь JSON сервисного аккаунта в одну строку
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Память по пользователю
-user_data: dict[int, dict] = {}
-referrals: dict[int, list[int]] = {}
+user_data = {}
+referrals = {}
 
-# ---------- Google Sheets helpers ----------
-def get_worksheet():
-    """Возвращает sheet1 или None, если переменные окружения не заданы."""
-    if not (SHEET_ID and SHEETS_CREDS_JSON):
-        return None
-    import gspread
-    from google.oauth2.service_account import Credentials
+# ✅ Подключение к Google Sheets
+SHEET_ID = "1392i1U93gV5FzipUXQ8RN9oP6xcr5i-Obbr4DdWCh84"
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-    creds_dict = json.loads(SHEETS_CREDS_JSON)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
-    return sh.sheet1
+creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPE)
+gs_client = gspread.authorize(creds)
+sheet = gs_client.open_by_key(SHEET_ID).sheet1
 
-def save_guest_to_sheets(user_id: int, first_name: str, last_name: str, company: str):
+def save_guest_to_sheets(user_id, first_name, last_name, company):
     try:
-        ws = get_worksheet()
-        if not ws:
-            return
-        ws.append_row([first_name, last_name, company, str(user_id)])
+        sheet.append_row([first_name, last_name, company, str(user_id)])
     except Exception as e:
-        log.exception("Ошибка при записи в таблицу: %s", e)
+        print("Ошибка при записи в таблицу:", e)
 
-# ---------- Handlers ----------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
-    # рефералка через deep-link /start <id>
     text = message.text or ""
     parts = text.split(maxsplit=1)
     args = parts[1] if len(parts) > 1 else None
@@ -79,165 +58,130 @@ async def start_handler(message: types.Message):
         if user_id not in referrals[inviter_id]:
             referrals[inviter_id].append(user_id)
 
-    if os.path.exists("templates/banner.png"):
-        await message.answer_photo(FSInputFile("templates/banner.png"))
-
+    banner = FSInputFile("templates/banner.png")
+    await message.answer_photo(photo=banner)
+    await asyncio.sleep(2)
     await message.answer(
         "Привет, рады тебя видеть!\n\n"
-        "Этот бот поможет оформить красивый инвайт и даёт право участвовать в розыгрыше VIP билета на PRO PARTY от Digital CPA Club. "
-        "Вечеринка пройдёт 14 августа в Москве в noorbar.com: кейс-программа, танцы, нетворкинг и коктейли.\n\n"
-        "Регистрация: [Timepad](https://digitalclub.timepad.ru/event/3457454/)",
-        parse_mode="Markdown",
+        "Этот бот поможет тебе оформить красивый инвайт, а также даёт право на участие в розыгрыше VIP билета на PRO PARTY от Digital CPA Club. "
+        "Вечеринка пройдёт 14 августа в Москве в noorbar.com, с кейс-программой, "
+        "танцами, нетворкингом и коктейлями.\n\n"
+        "Подробная информация и регистрация на мероприятие "
+        "[здесь](https://digitalclub.timepad.ru/event/3457454/)", parse_mode="Markdown"
     )
-    user_data[user_id] = {"stage": "ask_first"}
+    await asyncio.sleep(2)
     await message.answer("Как тебя зовут?")
+    user_data[user_id] = {}
 
-@dp.message(F.text)
-async def text_router(message: types.Message):
-    uid = message.from_user.id
-    st = user_data.get(uid)
+@dp.message(lambda m: m.from_user.id in user_data and 'first_name' not in user_data[m.from_user.id])
+async def get_first_name(message: types.Message):
+    user_data[message.from_user.id]['first_name'] = message.text.strip()
+    await asyncio.sleep(2)
+    await message.answer("Какая у тебя фамилия?")
 
-    # если бот перезапускался — начнём заново
-    if not st:
-        user_data[uid] = {"stage": "ask_first"}
-        await message.answer("Как тебя зовут?")
-        return
+@dp.message(lambda m: m.from_user.id in user_data and 'last_name' not in user_data[m.from_user.id])
+async def get_last_name(message: types.Message):
+    user_data[message.from_user.id]['last_name'] = message.text.strip()
+    await asyncio.sleep(2)
+    await message.answer("Из какой компании?")
 
-    txt = (message.text or "").strip()
-
-    if st["stage"] == "ask_first":
-        st["first_name"] = txt
-        st["stage"] = "ask_last"
-        await message.answer("Какая у тебя фамилия?")
-        return
-
-    if st["stage"] == "ask_last":
-        st["last_name"] = txt
-        st["stage"] = "ask_company"
-        await message.answer("Из какой компании?")
-        return
-
-    if st["stage"] == "ask_company":
-        st["company"] = txt
-        st["stage"] = "need_photo"
-        first = st.get("first_name") or "Гость"
-        await message.answer(f"{first}, приятно познакомиться.")
-        await message.answer("Теперь пришли свою фотографию (как изображение, НЕ как файл).")
-        return
-
-    if st["stage"] == "need_photo":
-        await message.answer("Жду фото как изображение 🙂")
-        return
-
-    # запасной случай
-    user_data[uid] = {"stage": "ask_first"}
-    await message.answer("Давай начнём заново. Как тебя зовут?")
+@dp.message(lambda m: m.from_user.id in user_data and 'company' not in user_data[m.from_user.id])
+async def get_company(message: types.Message):
+    user_data[message.from_user.id]['company'] = message.text.strip()
+    first = user_data[message.from_user.id]['first_name']
+    await asyncio.sleep(2)
+    await message.answer(f"{first}, приятно познакомиться.")
+    await asyncio.sleep(2)
+    await message.answer("Теперь пришли свою фотографию:")
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
+    await message.answer("Спасибо! Ещё секунду 😊")
+
+    photo_size = message.photo[-1]
+    file = await bot.get_file(photo_size.file_id)
+    bio = BytesIO()
+    await bot.download_file(file.file_path, bio)
+    bio.seek(0)
+
+    template = Image.open("templates/template.png").convert("RGBA")
+    overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
+
+    avatar = Image.open(bio).convert("RGBA")
+    w, h = avatar.size
+    tw, th = 471, 613
+
+    scale = max(tw / w, th / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    avatar = avatar.resize((new_w, new_h), Image.LANCZOS)
+
+    left = (new_w - tw) // 2
+    top = (new_h - th) // 2
+    avatar = avatar.crop((left, top, left + tw, top + th))
+
+    mask = Image.new('L', (tw, th), 0)
+    md = ImageDraw.Draw(mask)
+    md.rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
+    avatar.putalpha(mask)
+
+    border = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(border)
+    bd.rounded_rectangle((0, 0, tw + 2, th + 2), radius=40, outline='#FD693C', width=2)
+    border.paste(avatar, (2, 2), avatar)
+
+    pos = (template.width - 80 - tw, template.height - 377 - th)
+    overlay.paste(border, pos, border)
+    final = Image.alpha_composite(template, overlay)
+
+    draw = ImageDraw.Draw(final)
+    name_font = ImageFont.truetype("fonts/GothamPro-Black.ttf", 35)
+    comp_font = ImageFont.truetype("fonts/GothamPro-Medium.ttf", 30)
+
     uid = message.from_user.id
-    st = user_data.get(uid)
-    if not st or st.get("stage") != "need_photo":
-        await message.answer("Сначала введи имя/фамилию/компанию. Напиши /start, если нужна подсказка.")
-        return
+    full_name = f"{user_data[uid]['first_name']} {user_data[uid]['last_name']}"
+    company = user_data[uid]['company']
+
+    draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
+    draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
+
+    path = f"invite_{uid}.png"
+    final.convert("RGB").save(path, format="PNG")
+    await message.answer_photo(photo=FSInputFile(path))
+
+    await asyncio.sleep(2)
+    await message.answer(
+        "Чтобы участвовать в розыгрыше VIP билета —\n"
+        "Опубликуй картинку в сторис TG, FB или IG, прикрепи ссылку на Timepad (https://digitalclub.timepad.ru/event/3457454/)\n"
+    )
+
+    await asyncio.sleep(2)
+    await message.answer(
+        "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
+        "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
+        "Желаем тебе удачи! 🍀",
+        parse_mode="Markdown"
+    )
+
+    await asyncio.sleep(2)
+    await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]
+        ]
+    )
+    await message.answer("Если хочешь пересоздать — нажми на кнопку", reply_markup=markup)
+
+    save_guest_to_sheets(uid, user_data[uid]['first_name'], user_data[uid]['last_name'], user_data[uid]['company'])
 
     try:
-        await message.answer("Спасибо! Ещё секунду 😊")
-
-        # Скачиваем фото (aiogram v3)
-        photo_size = message.photo[-1]
-        file = await bot.get_file(photo_size.file_id)
-        bio = BytesIO()
-        await bot.download(file, destination=bio)
-        bio.seek(0)
-
-        # Шаблон
-        if not os.path.exists("templates/template.png"):
-            await message.answer("Не найден файл templates/template.png (1080×1080). Загрузите шаблон и попробуйте снова.")
-            return
-
-        template = Image.open("templates/template.png").convert("RGBA")
-        overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
-
-        # Аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
-        avatar = Image.open(bio).convert("RGBA")
-        w, h = avatar.size
-        tw, th = 471, 613
-
-        scale = max(tw / w, th / h)
-        avatar = avatar.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-        left = (avatar.width - tw) // 2
-        top = (avatar.height - th) // 2
-        avatar = avatar.crop((left, top, left + tw, top + th))
-
-        mask = Image.new('L', (tw, th), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
-        avatar.putalpha(mask)
-
-        border = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
-        bd = ImageDraw.Draw(border)
-        bd.rounded_rectangle((0, 0, tw + 2, th + 2), radius=40, outline='#FD693C', width=2)
-        border.paste(avatar, (2, 2), avatar)
-
-        # Позиционирование (правый нижний угол с отступами)
-        pos = (template.width - 80 - tw, template.height - 377 - th)
-        overlay.paste(border, pos, border)
-        final = Image.alpha_composite(template, overlay)
-
-        # Подписи
-        draw = ImageDraw.Draw(final)
-        try:
-            name_font = ImageFont.truetype("fonts/GothamPro-Black.ttf", 35)
-            comp_font = ImageFont.truetype("fonts/GothamPro-Medium.ttf", 30)
-        except Exception:
-            name_font = ImageFont.truetype("arial.ttf", 35)
-            comp_font = ImageFont.truetype("arial.ttf", 30)
-
-        full_name = f"{st.get('first_name','')} {st.get('last_name','')}".strip()
-        company = st.get('company', '')
-
-        draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
-        draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
-
-        path = f"invite_{uid}.png"
-        final.convert("RGB").save(path, format="PNG")
-        await message.answer_photo(photo=FSInputFile(path))
-
-        # Инструкции
-        await message.answer(
-            "Чтобы участвовать в розыгрыше VIP билета —\n"
-            "Опубликуй картинку в сторис TG, FB или IG, прикрепи ссылку на Timepad (https://digitalclub.timepad.ru/event/3457454/)\n"
-        )
-        await message.answer(
-            "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
-            "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
-            "Желаем тебе удачи! 🍀",
-            parse_mode="Markdown",
-        )
-        await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
-
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]]
-        )
-        await message.answer("Если хочешь пересоздать — нажми на кнопку", reply_markup=markup)
-
-        # Запись в таблицу
-        save_guest_to_sheets(uid, st.get('first_name',''), st.get('last_name',''), company)
-
-        # очистим временный файл и сбросим сценарий
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        user_data[uid] = {"stage": "ask_first"}
-
-    except Exception as e:
-        log.exception("Ошибка обработки фото: %s", e)
-        await message.answer("Ой! Фото не обработалось. Попробуй ещё раз или пришли другое изображение.")
+        os.remove(path)
+    except OSError:
+        pass
 
 @dp.callback_query(F.data == "retry_photo")
 async def retry_photo_handler(callback: CallbackQuery):
-    user_data[callback.from_user.id] = {"stage": "need_photo"}
     await callback.message.answer("Окей! Отправь новое фото, и мы пересоздадим пригласительный ✨")
 
 @dp.message(Command("whoami"))
@@ -251,16 +195,11 @@ async def draw_winner(message: types.Message):
         await message.answer("У тебя нет доступа к розыгрышу.")
         return
 
-    ws = get_worksheet()
-    if not ws:
-        await message.answer("Google Sheets не настроен.")
-        return
-
     try:
-        records = ws.get_all_records()
+        records = sheet.get_all_records()
     except Exception as e:
         await message.answer("Ошибка доступа к таблице.")
-        log.exception("Ошибка Google Sheets: %s", e)
+        print("Ошибка Google Sheets:", e)
         return
 
     if not records:
@@ -268,24 +207,38 @@ async def draw_winner(message: types.Message):
         return
 
     await message.answer("🎰 Запускаем барабан...")
+    await asyncio.sleep(1)
+
     suspense_list = random.sample(records, min(6, len(records)))
     for r in suspense_list[:-1]:
-        fn = r.get('Имя') or r.get('first_name') or ''
-        ln = r.get('Фамилия') or r.get('last_name') or ''
-        await message.answer(f"🌀 {fn} {ln}...")
-    winner = suspense_list[-1]
-    fn = winner.get('Имя') or winner.get('first_name') or ''
-    ln = winner.get('Фамилия') or winner.get('last_name') or ''
-    company = winner.get('Компания') or winner.get('company') or ''
-    win_id = winner.get('ID') or winner.get('id') or ''
+        await message.answer(f"🌀 {r['Имя']} {r['Фамилия']}...")
+        await asyncio.sleep(0.8)
 
-    await message.answer(f"🎉 Победитель:\n\n👑 {fn} {ln}, {company}\n\n🔥 Поздравляем!")
-    if win_id:
-        try:
-            await bot.send_message(int(win_id), f"🎉 Поздравляем, {fn} {ln}! Ты выиграл приз от Digital CPA Club 🎁")
-        except Exception as e:
-            await message.answer("⚠️ Не удалось отправить личное сообщение победителю.")
-            log.exception("Ошибка при отправке победителю: %s", e)
+    winner = suspense_list[-1]
+    await asyncio.sleep(1.5)
+    await message.answer("🥁🥁🥁")
+    await asyncio.sleep(1)
+
+    winner_name = f"{winner['Имя']} {winner['Фамилия']}"
+    winner_company = winner['Компания']
+    winner_id = winner['ID']
+
+    await message.answer(
+        f"🎉 Победитель розыгрыша:\n\n"
+        f"👑 {winner_name}, {winner_company}\n\n"
+        f"🔥 Поздравляем!"
+    )
+
+    try:
+        await bot.send_message(
+            int(winner_id),
+            f"🎉 Поздравляем, {winner_name}!\n\n"
+            f"Ты выиграл приз от Digital CPA Club 🎁\n"
+            f"Скоро с тобой свяжется организатор. До встречи на Pro Party!"
+        )
+    except Exception as e:
+        await message.answer("⚠️ Не удалось отправить личное сообщение победителю.")
+        print("Ошибка при отправке сообщения победителю:", e)
 
 @dp.message(Command("mystats"))
 async def mystats_handler(message: types.Message):
@@ -293,23 +246,8 @@ async def mystats_handler(message: types.Message):
     invited = referrals.get(uid, [])
     await message.answer(f"Ты пригласил {len(invited)} человек(а).")
 
-# ---------- Webhook bootstrapping ----------
-async def on_startup(app: web.Application):
-    assert BASE_URL, "BASE_URL/RENDER_EXTERNAL_URL не задан"
-    url = BASE_URL.rstrip("/") + "/webhook"
-    await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
-    log.info("Webhook set to %s", url)
-
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=False)
-
-def build_app():
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path="/webhook")
-    setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    return app
+async def main():
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
-    web.run_app(build_app(), host="0.0.0.0", port=PORT)
+    asyncio.run(main())
