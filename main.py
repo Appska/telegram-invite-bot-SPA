@@ -1,9 +1,10 @@
-# main.py — Render + webhook (aiogram v3) + stages + verbose logging + Google Sheets
+# main.py — Render + webhook (aiogram v3) + stages + accepts photo & image documents + 2s pauses + Sheets
 
 import os
 import json
 import random
 import logging
+import asyncio
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, types, F
@@ -35,6 +36,10 @@ dp = Dispatcher()
 user_data: dict[int, dict] = {}
 referrals: dict[int, list[int]] = {}
 
+TEMPLATE_PATH = "templates/template.png"
+FONT_NAME = "fonts/GothamPro-Black.ttf"
+FONT_COMP = "fonts/GothamPro-Medium.ttf"
+
 # ---------- Google Sheets helpers ----------
 def get_worksheet():
     if not (SHEET_ID and SHEETS_CREDS_JSON):
@@ -65,6 +70,67 @@ def save_guest_to_sheets(user_id: int, first_name: str, last_name: str, company:
     except Exception as e:
         log.exception("Sheets: ошибка при записи: %s", e)
 
+# ---------- Common image processing ----------
+def make_invite(image_bytes: BytesIO, first_name: str, last_name: str, company: str, uid: int) -> str:
+    if not os.path.exists(TEMPLATE_PATH):
+        raise FileNotFoundError(f"Не найден шаблон {TEMPLATE_PATH}")
+
+    template = Image.open(TEMPLATE_PATH).convert("RGBA")
+    overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
+
+    # Аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
+    avatar = Image.open(image_bytes).convert("RGBA")
+    w, h = avatar.size
+    tw, th = 471, 613
+    log.info("Original avatar size: %dx%d", w, h)
+
+    scale = max(tw / w, th / h)
+    avatar = avatar.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    left = (avatar.width - tw) // 2
+    top = (avatar.height - th) // 2
+    avatar = avatar.crop((left, top, left + tw, top + th))
+
+    mask = Image.new('L', (tw, th), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
+    avatar.putalpha(mask)
+
+    border = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(border)
+    bd.rounded_rectangle((0, 0, tw + 2, th + 2), radius=40, outline='#FD693C', width=2)
+    border.paste(avatar, (2, 2), avatar)
+
+    # Позиционирование (правый нижний угол с отступами)
+    pos = (template.width - 80 - tw, template.height - 377 - th)
+    overlay.paste(border, pos, border)
+    final = Image.alpha_composite(template, overlay)
+
+    # Подписи
+    draw = ImageDraw.Draw(final)
+    try:
+        name_font = ImageFont.truetype(FONT_NAME, 35)
+        comp_font = ImageFont.truetype(FONT_COMP, 30)
+    except Exception:
+        name_font = ImageFont.truetype("arial.ttf", 35)
+        comp_font = ImageFont.truetype("arial.ttf", 30)
+
+    full_name = f"{first_name} {last_name}".strip()
+    draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
+    draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
+
+    path = f"invite_{uid}.png"
+    final.convert("RGB").save(path, format="PNG")
+    log.info("Invite saved to %s (uid=%s)", path, uid)
+    return path
+
+async def download_file_to_memory(file_id: str) -> BytesIO:
+    file = await bot.get_file(file_id)
+    bio = BytesIO()
+    # aiogram v3: bot.download(file, destination=...)
+    await bot.download(file, destination=bio)
+    bio.seek(0)
+    log.info("Downloaded bytes: %d", bio.getbuffer().nbytes)
+    return bio
+
 # ---------- Handlers ----------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
@@ -90,6 +156,7 @@ async def start_handler(message: types.Message):
         "Регистрация: [Timepad](https://digitalclub.timepad.ru/event/3457454/)",
         parse_mode="Markdown",
     )
+    await asyncio.sleep(2)
     user_data[user_id] = {"stage": "ask_first"}
     await message.answer("Как тебя зовут?")
     log.info("Stage set to ask_first for %s", user_id)
@@ -104,141 +171,103 @@ async def text_router(message: types.Message):
     if not st:
         user_data[uid] = {"stage": "ask_first"}
         await message.answer("Как тебя зовут?")
-        log.info("No state → reset to ask_first for %s", uid)
         return
 
     if st["stage"] == "ask_first":
         st["first_name"] = txt
         st["stage"] = "ask_last"
         await message.answer("Какая у тебя фамилия?")
-        log.info("ask_first → ask_last for %s, first_name=%r", uid, txt)
         return
 
     if st["stage"] == "ask_last":
         st["last_name"] = txt
         st["stage"] = "ask_company"
+        await asyncio.sleep(2)
         await message.answer("Из какой компании?")
-        log.info("ask_last → ask_company for %s, last_name=%r", uid, txt)
         return
 
     if st["stage"] == "ask_company":
         st["company"] = txt
         st["stage"] = "need_photo"
         first = st.get("first_name") or "Гость"
+        await asyncio.sleep(2)
         await message.answer(f"{first}, приятно познакомиться.")
+        await asyncio.sleep(2)
         await message.answer("Теперь пришли свою фотографию (как изображение, НЕ как файл).")
-        log.info("ask_company → need_photo for %s, company=%r", uid, txt)
         return
 
     if st["stage"] == "need_photo":
         await message.answer("Жду фото как изображение 🙂")
-        log.info("Received text but need photo (uid=%s)", uid)
         return
 
     # запасной случай
     user_data[uid] = {"stage": "ask_first"}
     await message.answer("Давай начнём заново. Как тебя зовут?")
-    log.info("Fallback reset for %s", uid)
 
+# Принимаем СНИМКИ как фотографии
 @dp.message(F.photo)
-async def handle_photo(message: types.Message):
+async def on_photo(message: types.Message):
+    await handle_image_message(message, source="photo")
+
+# Принимаем СНИМКИ как документы (фотки, присланные «как файл»)
+@dp.message(F.document)
+async def on_document(message: types.Message):
+    doc = message.document
+    if not doc or not (doc.mime_type or "").startswith("image/"):
+        # не картинка — игнорируем
+        return
+    await handle_image_message(message, source="document")
+
+async def handle_image_message(message: types.Message, source: str):
     uid = message.from_user.id
     st = user_data.get(uid)
-    log.info("PHOTO from %s, stage=%s", uid, st.get("stage") if st else None)
+    log.info("IMAGE from %s via %s, stage=%s", uid, source, st.get("stage") if st else None)
 
     if not st or st.get("stage") != "need_photo":
         await message.answer("Сначала введи имя/фамилию/компанию. Напиши /start, если нужна подсказка.")
-        log.info("Photo ignored: wrong stage (uid=%s)", uid)
         return
 
     try:
         await message.answer("Спасибо! Ещё секунду 😊")
 
-        # Скачиваем фото (aiogram v3)
-        photo_size = message.photo[-1]
-        file = await bot.get_file(photo_size.file_id)
-        bio = BytesIO()
-        await bot.download(file, destination=bio)
-        bio.seek(0)
-        log.info("Downloaded photo for %s, size=%d bytes", uid, bio.getbuffer().nbytes)
+        # Получаем байты изображения
+        if source == "photo":
+            photo_size = message.photo[-1]
+            image_bytes = await download_file_to_memory(photo_size.file_id)
+        else:
+            image_bytes = await download_file_to_memory(message.document.file_id)
 
-        # Шаблон
-        tpl_path = "templates/template.png"
-        if not os.path.exists(tpl_path):
-            await message.answer("Не найден файл templates/template.png (1080×1080). Загрузите шаблон и попробуйте снова.")
-            log.error("Template not found at %s", tpl_path)
-            return
+        # Генерим пригласительный
+        path = make_invite(
+            image_bytes=image_bytes,
+            first_name=st.get('first_name', ''),
+            last_name=st.get('last_name', ''),
+            company=st.get('company', ''),
+            uid=uid
+        )
 
-        template = Image.open(tpl_path).convert("RGBA")
-        overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
-
-        # Аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
-        avatar = Image.open(bio).convert("RGBA")
-        w, h = avatar.size
-        tw, th = 471, 613
-        log.info("Original avatar size: %dx%d", w, h)
-
-        scale = max(tw / w, th / h)
-        avatar = avatar.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-        left = (avatar.width - tw) // 2
-        top = (avatar.height - th) // 2
-        avatar = avatar.crop((left, top, left + tw, top + th))
-
-        mask = Image.new('L', (tw, th), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
-        avatar.putalpha(mask)
-
-        border = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
-        bd = ImageDraw.Draw(border)
-        bd.rounded_rectangle((0, 0, tw + 2, th + 2), radius=40, outline='#FD693C', width=2)
-        border.paste(avatar, (2, 2), avatar)
-
-        # Позиционирование
-        pos = (template.width - 80 - tw, template.height - 377 - th)
-        overlay.paste(border, pos, border)
-        final = Image.alpha_composite(template, overlay)
-
-        # Подписи
-        draw = ImageDraw.Draw(final)
-        try:
-            name_font = ImageFont.truetype("fonts/GothamPro-Black.ttf", 35)
-            comp_font = ImageFont.truetype("fonts/GothamPro-Medium.ttf", 30)
-        except Exception:
-            name_font = ImageFont.truetype("arial.ttf", 35)
-            comp_font = ImageFont.truetype("arial.ttf", 30)
-
-        full_name = f"{st.get('first_name','')} {st.get('last_name','')}".strip()
-        company = st.get('company', '')
-        draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
-        draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
-
-        path = f"invite_{uid}.png"
-        final.convert("RGB").save(path, format="PNG")
-        log.info("Invite saved to %s (uid=%s)", path, uid)
+        await asyncio.sleep(2)
         await message.answer_photo(photo=FSInputFile(path))
 
-        # Инструкции
+        await asyncio.sleep(2)
         await message.answer(
             "Чтобы участвовать в розыгрыше VIP билета —\n"
             "Опубликуй картинку в сторис TG, FB или IG, прикрепи ссылку на Timepad (https://digitalclub.timepad.ru/event/3457454/)\n"
         )
+        await asyncio.sleep(2)
         await message.answer(
             "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
             "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
             "Желаем тебе удачи! 🍀",
             parse_mode="Markdown",
         )
+        await asyncio.sleep(2)
         await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
 
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]]
-        )
-        await message.answer("Если хочешь пересоздать — нажми на кнопку", reply_markup=markup)
-
         # Запись в таблицу
-        save_guest_to_sheets(uid, st.get('first_name',''), st.get('last_name',''), company)
+        save_guest_to_sheets(uid, st.get('first_name',''), st.get('last_name',''), st.get('company',''))
 
-        # очистим временный файл и сбросим сценарий
+        # очистка и сброс
         try:
             os.remove(path)
         except OSError:
@@ -246,14 +275,17 @@ async def handle_photo(message: types.Message):
         user_data[uid] = {"stage": "ask_first"}
         log.info("Flow done, reset stage for %s", uid)
 
+    except FileNotFoundError as e:
+        log.exception("Template missing: %s", e)
+        await message.answer("Не найден файл templates/template.png (1080×1080). Загрузите шаблон и попробуйте снова.")
     except Exception as e:
-        log.exception("Ошибка обработки фото (uid=%s): %s", uid, e)
-        await message.answer("Ой! Фото не обработалось. Попробуй ещё раз или пришли другое изображение.")
+        log.exception("Ошибка обработки изображения (uid=%s): %s", uid, e)
+        await message.answer("Ой! Картинка не обработалась. Пришли другое изображение или попробуй ещё раз.")
 
 @dp.callback_query(F.data == "retry_photo")
 async def retry_photo_handler(callback: CallbackQuery):
     user_data[callback.from_user.id] = {"stage": "need_photo"}
-    await callback.message.answer("Окей! Отправь новое фото, и мы пересоздадим пригласительный ✨")
+    await callback.message.answer("Окей! Отправь новое фото/изображение, и мы пересоздадим пригласительный ✨")
     log.info("Retry requested by %s → stage need_photo", callback.from_user.id)
 
 @dp.message(Command("whoami"))
@@ -288,6 +320,7 @@ async def draw_winner(message: types.Message):
     for r in suspense_list[:-1]:
         fn = r.get('Имя') or r.get('first_name') or ''
         ln = r.get('Фамилия') or r.get('last_name') or ''
+        await asyncio.sleep(2)
         await message.answer(f"🌀 {fn} {ln}...")
     winner = suspense_list[-1]
     fn = winner.get('Имя') or winner.get('first_name') or ''
@@ -295,6 +328,7 @@ async def draw_winner(message: types.Message):
     company = winner.get('Компания') or winner.get('company') or ''
     win_id = winner.get('ID') or winner.get('id') or ''
 
+    await asyncio.sleep(2)
     await message.answer(f"🎉 Победитель:\n\n👑 {fn} {ln}, {company}\n\n🔥 Поздравляем!")
     if win_id:
         try:
