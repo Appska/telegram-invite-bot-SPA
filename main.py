@@ -1,7 +1,6 @@
 # main.py — Render + webhook (aiogram v3)
 
 import os
-import asyncio
 import json
 import random
 from io import BytesIO
@@ -12,24 +11,23 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 
 from PIL import Image, ImageDraw, ImageFont
 
-# --- Webhook сервер на aiohttp
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# --- Google Sheets (ленивое подключение через ENV)
-SHEET_ID = os.getenv("SHEET_ID")  # например: 1392i1U93gV5...
-SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # полный JSON сервисного аккаунта в одну строку
-
+# --- ENV
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_secret_123")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
+SHEET_ID = os.getenv("SHEET_ID")               # 1392i1U93gV5FzipUXQ8RN9oP6xcr5i-Obbr4DdWCh84
+SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # весь JSON ключа сервисного аккаунта в одну строку
+
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-user_data = {}
-referrals = {}
+user_data: dict[int, dict] = {}
+referrals: dict[int, list[int]] = {}
 
 # ---------- Google Sheets helpers ----------
 def get_worksheet():
@@ -52,12 +50,11 @@ def get_worksheet():
     sh = gc.open_by_key(SHEET_ID)
     return sh.sheet1
 
-def save_guest_to_sheets(user_id, first_name, last_name, company):
+def save_guest_to_sheets(user_id: int, first_name: str, last_name: str, company: str):
     try:
         ws = get_worksheet()
         if not ws:
             return
-        # при желании можно сделать заголовки, если лист пустой
         ws.append_row([first_name, last_name, company, str(user_id)])
     except Exception as e:
         print("Ошибка при записи в таблицу:", e)
@@ -76,18 +73,14 @@ async def start_handler(message: types.Message):
         if user_id not in referrals[inviter_id]:
             referrals[inviter_id].append(user_id)
 
-    # баннер, если есть
     if os.path.exists("templates/banner.png"):
-        banner = FSInputFile("templates/banner.png")
-        await message.answer_photo(photo=banner)
+        await message.answer_photo(FSInputFile("templates/banner.png"))
 
     await message.answer(
         "Привет, рады тебя видеть!\n\n"
-        "Этот бот поможет тебе оформить красивый инвайт, а также даёт право на участие в розыгрыше VIP билета на PRO PARTY от Digital CPA Club. "
-        "Вечеринка пройдёт 14 августа в Москве в noorbar.com, с кейс-программой, "
-        "танцами, нетворкингом и коктейлями.\n\n"
-        "Подробная информация и регистрация на мероприятие "
-        "[здесь](https://digitalclub.timepad.ru/event/3457454/)",
+        "Этот бот поможет оформить красивый инвайт и даёт право участвовать в розыгрыше VIP билета на PRO PARTY от Digital CPA Club. "
+        "Вечеринка пройдёт 14 августа в Москве в noorbar.com, с кейс-программой, танцами, нетворкингом и коктейлями.\n\n"
+        "Регистрация: [Timepad](https://digitalclub.timepad.ru/event/3457454/)",
         parse_mode="Markdown"
     )
     await message.answer("Как тебя зовут?")
@@ -106,7 +99,7 @@ async def get_last_name(message: types.Message):
 @dp.message(lambda m: m.from_user.id in user_data and 'company' not in user_data[m.from_user.id])
 async def get_company(message: types.Message):
     user_data[message.from_user.id]['company'] = (message.text or "").strip()
-    first = user_data[message.from_user.id]['first_name'] or "Гость"
+    first = user_data[message.from_user.id].get('first_name') or "Гость"
     await message.answer(f"{first}, приятно познакомиться.")
     await message.answer("Теперь пришли свою фотографию:")
 
@@ -129,24 +122,19 @@ async def handle_photo(message: types.Message):
     template = Image.open("templates/template.png").convert("RGBA")
     overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
 
-    # Готовим аватар
+    # Готовим аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
     avatar = Image.open(bio).convert("RGBA")
     w, h = avatar.size
-    tw, th = 471, 613  # твои размеры кадра
+    tw, th = 471, 613
 
     scale = max(tw / w, th / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    avatar = avatar.resize((new_w, new_h), Image.LANCZOS)
-
-    left = (new_w - tw) // 2
-    top = (new_h - th) // 2
+    avatar = avatar.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    left = (avatar.width - tw) // 2
+    top = (avatar.height - th) // 2
     avatar = avatar.crop((left, top, left + tw, top + th))
 
-    # Скругление + внутренняя обводка
     mask = Image.new('L', (tw, th), 0)
-    md = ImageDraw.Draw(mask)
-    md.rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, tw, th), radius=40, fill=255)
     avatar.putalpha(mask)
 
     border = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
@@ -165,7 +153,6 @@ async def handle_photo(message: types.Message):
         name_font = ImageFont.truetype("fonts/GothamPro-Black.ttf", 35)
         comp_font = ImageFont.truetype("fonts/GothamPro-Medium.ttf", 30)
     except Exception:
-        # запасной вариант, если шрифты не нашли
         name_font = ImageFont.truetype("arial.ttf", 35)
         comp_font = ImageFont.truetype("arial.ttf", 30)
 
@@ -173,11 +160,9 @@ async def handle_photo(message: types.Message):
     full_name = f"{user_data[uid].get('first_name','')} {user_data[uid].get('last_name','')}".strip()
     company = user_data[uid].get('company', '')
 
-    # Белый текст (как у тебя)
     draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
     draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
 
-    # Отправляем картинку
     path = f"invite_{uid}.png"
     final.convert("RGB").save(path, format="PNG")
     await message.answer_photo(photo=FSInputFile(path))
@@ -190,4 +175,100 @@ async def handle_photo(message: types.Message):
         "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
         "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
         "Желаем тебе удачи! 🍀",
-        parse_m_
+        parse_mode="Markdown"
+    )
+    await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]
+        ]
+    )
+    await message.answer("Если хочешь пересоздать — нажми на кнопку", reply_markup=markup)
+
+    # Запишем в таблицу
+    save_guest_to_sheets(uid, user_data[uid].get('first_name',''), user_data[uid].get('last_name',''), company)
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+@dp.callback_query(F.data == "retry_photo")
+async def retry_photo_handler(callback: CallbackQuery):
+    await callback.message.answer("Окей! Отправь новое фото, и мы пересоздадим пригласительный ✨")
+
+@dp.message(Command("whoami"))
+async def whoami(message: types.Message):
+    await message.answer(f"Твой user_id: {message.from_user.id}")
+
+@dp.message(Command("draw"))
+async def draw_winner(message: types.Message):
+    admin_ids = [2002200912]
+    if message.from_user.id not in admin_ids:
+        await message.answer("У тебя нет доступа к розыгрышу.")
+        return
+
+    ws = get_worksheet()
+    if not ws:
+        await message.answer("Google Sheets не настроен.")
+        return
+
+    try:
+        records = ws.get_all_records()
+    except Exception as e:
+        await message.answer("Ошибка доступа к таблице.")
+        print("Ошибка Google Sheets:", e)
+        return
+
+    if not records:
+        await message.answer("Список участников пуст.")
+        return
+
+    await message.answer("🎰 Запускаем барабан...")
+    suspense_list = random.sample(records, min(6, len(records)))
+    for r in suspense_list[:-1]:
+        fn = r.get('Имя') or r.get('first_name') or ''
+        ln = r.get('Фамилия') or r.get('last_name') or ''
+        await message.answer(f"🌀 {fn} {ln}...")
+    winner = suspense_list[-1]
+    fn = winner.get('Имя') or winner.get('first_name') or ''
+    ln = winner.get('Фамилия') or winner.get('last_name') or ''
+    company = winner.get('Компания') or winner.get('company') or ''
+    win_id = winner.get('ID') or winner.get('id') or ''
+
+    await message.answer(
+        f"🎉 Победитель розыгрыша:\n\n👑 {fn} {ln}, {company}\n\n🔥 Поздравляем!"
+    )
+    if win_id:
+        try:
+            await bot.send_message(int(win_id), f"🎉 Поздравляем, {fn} {ln}! Ты выиграл приз от Digital CPA Club 🎁")
+        except Exception as e:
+            await message.answer("⚠️ Не удалось отправить личное сообщение победителю.")
+            print("Ошибка при отправке победителю:", e)
+
+@dp.message(Command("mystats"))
+async def mystats_handler(message: types.Message):
+    uid = message.from_user.id
+    invited = referrals.get(uid, [])
+    await message.answer(f"Ты пригласил {len(invited)} человек(а).")
+
+# ---------- Webhook bootstrapping ----------
+async def on_startup(app: web.Application):
+    assert BASE_URL, "BASE_URL/RENDER_EXTERNAL_URL не задан"
+    url = BASE_URL.rstrip("/") + "/webhook"
+    await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+
+async def on_shutdown(app: web.Application):
+    await bot.delete_webhook(drop_pending_updates=False)
+
+def build_app():
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    return app
+
+if __name__ == "__main__":
+    web.run_app(build_app(), host="0.0.0.0", port=PORT)
