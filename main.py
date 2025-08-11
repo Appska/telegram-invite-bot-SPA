@@ -1,4 +1,4 @@
-# main.py — Render + webhook (aiogram v3)
+# main.py — Render + webhook (aiogram v3) + stages + Google Sheets
 
 import os
 import json
@@ -15,27 +15,29 @@ from PIL import Image, ImageDraw, ImageFont
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# --- логирование
+# ---------- Logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("invite-bot")
 
-# --- ENV
+# ---------- ENV
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_secret_123")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
-SHEET_ID = os.getenv("SHEET_ID")
-SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")
+SHEET_ID = os.getenv("SHEET_ID")                 # напр. 1392i1U93gV5...
+SHEETS_CREDS_JSON = os.getenv("SHEETS_CREDS_JSON")  # весь JSON сервисного аккаунта в одну строку
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
+# Память по пользователю
 user_data: dict[int, dict] = {}
 referrals: dict[int, list[int]] = {}
 
 # ---------- Google Sheets helpers ----------
 def get_worksheet():
+    """Возвращает sheet1 или None, если переменные окружения не заданы."""
     if not (SHEET_ID and SHEETS_CREDS_JSON):
         return None
     import gspread
@@ -62,9 +64,10 @@ def save_guest_to_sheets(user_id: int, first_name: str, last_name: str, company:
     except Exception as e:
         log.exception("Ошибка при записи в таблицу: %s", e)
 
-# ---------- Хэндлеры ----------
+# ---------- Handlers ----------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
+    # рефералка через deep-link /start <id>
     text = message.text or ""
     parts = text.split(maxsplit=1)
     args = parts[1] if len(parts) > 1 else None
@@ -82,32 +85,62 @@ async def start_handler(message: types.Message):
     await message.answer(
         "Привет, рады тебя видеть!\n\n"
         "Этот бот поможет оформить красивый инвайт и даёт право участвовать в розыгрыше VIP билета на PRO PARTY от Digital CPA Club. "
-        "Вечеринка пройдёт 14 августа в Москве в noorbar.com, с кейс-программой, танцами, нетворкингом и коктейлями.\n\n"
+        "Вечеринка пройдёт 14 августа в Москве в noorbar.com: кейс-программа, танцы, нетворкинг и коктейли.\n\n"
         "Регистрация: [Timepad](https://digitalclub.timepad.ru/event/3457454/)",
         parse_mode="Markdown",
     )
+    user_data[user_id] = {"stage": "ask_first"}
     await message.answer("Как тебя зовут?")
-    user_data[user_id] = {}
 
-@dp.message(lambda m: m.from_user.id in user_data and 'first_name' not in user_data[m.from_user.id])
-async def get_first_name(message: types.Message):
-    user_data[message.from_user.id]['first_name'] = (message.text or "").strip()
-    await message.answer("Какая у тебя фамилия?")
+@dp.message(F.text)
+async def text_router(message: types.Message):
+    uid = message.from_user.id
+    st = user_data.get(uid)
 
-@dp.message(lambda m: m.from_user.id in user_data and 'last_name' not in user_data[m.from_user.id])
-async def get_last_name(message: types.Message):
-    user_data[message.from_user.id]['last_name'] = (message.text or "").strip()
-    await message.answer("Из какой компании?")
+    # если бот перезапускался — начнём заново
+    if not st:
+        user_data[uid] = {"stage": "ask_first"}
+        await message.answer("Как тебя зовут?")
+        return
 
-@dp.message(lambda m: m.from_user.id in user_data and 'company' not in user_data[m.from_user.id])
-async def get_company(message: types.Message):
-    user_data[message.from_user.id]['company'] = (message.text or "").strip()
-    first = user_data[message.from_user.id].get('first_name') or "Гость"
-    await message.answer(f"{first}, приятно познакомиться.")
-    await message.answer("Теперь пришли свою фотографию (как изображение, не файлом).")
+    txt = (message.text or "").strip()
+
+    if st["stage"] == "ask_first":
+        st["first_name"] = txt
+        st["stage"] = "ask_last"
+        await message.answer("Какая у тебя фамилия?")
+        return
+
+    if st["stage"] == "ask_last":
+        st["last_name"] = txt
+        st["stage"] = "ask_company"
+        await message.answer("Из какой компании?")
+        return
+
+    if st["stage"] == "ask_company":
+        st["company"] = txt
+        st["stage"] = "need_photo"
+        first = st.get("first_name") or "Гость"
+        await message.answer(f"{first}, приятно познакомиться.")
+        await message.answer("Теперь пришли свою фотографию (как изображение, НЕ как файл).")
+        return
+
+    if st["stage"] == "need_photo":
+        await message.answer("Жду фото как изображение 🙂")
+        return
+
+    # запасной случай
+    user_data[uid] = {"stage": "ask_first"}
+    await message.answer("Давай начнём заново. Как тебя зовут?")
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
+    uid = message.from_user.id
+    st = user_data.get(uid)
+    if not st or st.get("stage") != "need_photo":
+        await message.answer("Сначала введи имя/фамилию/компанию. Напиши /start, если нужна подсказка.")
+        return
+
     try:
         await message.answer("Спасибо! Ещё секунду 😊")
 
@@ -118,7 +151,7 @@ async def handle_photo(message: types.Message):
         await bot.download(file, destination=bio)
         bio.seek(0)
 
-        # Загружаем шаблон
+        # Шаблон
         if not os.path.exists("templates/template.png"):
             await message.answer("Не найден файл templates/template.png (1080×1080). Загрузите шаблон и попробуйте снова.")
             return
@@ -126,7 +159,7 @@ async def handle_photo(message: types.Message):
         template = Image.open("templates/template.png").convert("RGBA")
         overlay = Image.new('RGBA', template.size, (255, 255, 255, 0))
 
-        # Готовим аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
+        # Аватар (471×613), скругление 40, внутренняя обводка #FD693C 2px
         avatar = Image.open(bio).convert("RGBA")
         w, h = avatar.size
         tw, th = 471, 613
@@ -146,7 +179,7 @@ async def handle_photo(message: types.Message):
         bd.rounded_rectangle((0, 0, tw + 2, th + 2), radius=40, outline='#FD693C', width=2)
         border.paste(avatar, (2, 2), avatar)
 
-        # Позиционирование (правый нижний угол с твоими отступами)
+        # Позиционирование (правый нижний угол с отступами)
         pos = (template.width - 80 - tw, template.height - 377 - th)
         overlay.paste(border, pos, border)
         final = Image.alpha_composite(template, overlay)
@@ -160,9 +193,8 @@ async def handle_photo(message: types.Message):
             name_font = ImageFont.truetype("arial.ttf", 35)
             comp_font = ImageFont.truetype("arial.ttf", 30)
 
-        uid = message.from_user.id
-        full_name = f"{user_data[uid].get('first_name','')} {user_data[uid].get('last_name','')}".strip()
-        company = user_data[uid].get('company', '')
+        full_name = f"{st.get('first_name','')} {st.get('last_name','')}".strip()
+        company = st.get('company', '')
 
         draw.text((pos[0], pos[1] + th + 50), full_name, font=name_font, fill=(255, 255, 255))
         draw.text((pos[0], pos[1] + th + 100), company, font=comp_font, fill=(255, 255, 255))
@@ -171,6 +203,7 @@ async def handle_photo(message: types.Message):
         final.convert("RGB").save(path, format="PNG")
         await message.answer_photo(photo=FSInputFile(path))
 
+        # Инструкции
         await message.answer(
             "Чтобы участвовать в розыгрыше VIP билета —\n"
             "Опубликуй картинку в сторис TG, FB или IG, прикрепи ссылку на Timepad (https://digitalclub.timepad.ru/event/3457454/)\n"
@@ -179,31 +212,32 @@ async def handle_photo(message: types.Message):
             "🎁 Победитель будет выбран случайным образом 12 августа.\n\n"
             "Следи за розыгрышем и его результатами в клубе [здесь](https://t.me/+l6rrLeN7Eho3ZjQy)\n\n"
             "Желаем тебе удачи! 🍀",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
         await message.answer("Поделись приглашением с коллегами по рынку: @proparty_invite_bot")
 
         markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]
-            ]
+            inline_keyboard=[[InlineKeyboardButton(text="🔄 Пересоздать картинку", callback_data="retry_photo")]]
         )
         await message.answer("Если хочешь пересоздать — нажми на кнопку", reply_markup=markup)
 
-        # Запишем в таблицу
-        save_guest_to_sheets(uid, user_data[uid].get('first_name',''), user_data[uid].get('last_name',''), company)
+        # Запись в таблицу
+        save_guest_to_sheets(uid, st.get('first_name',''), st.get('last_name',''), company)
 
+        # очистим временный файл и сбросим сценарий
         try:
             os.remove(path)
         except OSError:
             pass
+        user_data[uid] = {"stage": "ask_first"}
 
     except Exception as e:
         log.exception("Ошибка обработки фото: %s", e)
-        await message.answer("Ой! Фото не обработалось. Я уже чиню. Попробуй ещё раз или пришли другое изображение.")
+        await message.answer("Ой! Фото не обработалось. Попробуй ещё раз или пришли другое изображение.")
 
 @dp.callback_query(F.data == "retry_photo")
 async def retry_photo_handler(callback: CallbackQuery):
+    user_data[callback.from_user.id] = {"stage": "need_photo"}
     await callback.message.answer("Окей! Отправь новое фото, и мы пересоздадим пригласительный ✨")
 
 @dp.message(Command("whoami"))
