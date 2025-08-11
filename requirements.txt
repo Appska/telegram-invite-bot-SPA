@@ -1,0 +1,8 @@
+aiogram==2.24.2
+pillow==11.0.0
+
+flask
+openpyxl
+gspread
+oauth2client
+google-auth
